@@ -110,11 +110,12 @@ def train(
     train_ds = Subset(HandLandmarkDataset(data_dir, augment=True), train_indices)
     val_ds = Subset(HandLandmarkDataset(data_dir, augment=False), val_indices)
 
+    use_cuda = torch.cuda.is_available()
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=use_cuda
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=use_cuda
     )
 
     print(f"Dataset: {len(train_ds)} training samples, {len(val_ds)} validation samples")

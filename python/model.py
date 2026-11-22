@@ -98,15 +98,27 @@ def export_onnx(
     """Export model to ONNX for downstream ESP-DL / PPQ quantisation."""
     model.eval()
     dummy = torch.randn(1, 1, 96, 96)
-    torch.onnx.export(
-        model,
-        dummy,
-        path,
-        input_names=["input"],
-        output_names=["landmarks"],
-        opset_version=opset,
-        do_constant_folding=True,
-    )
+    try:
+        torch.onnx.export(
+            model,
+            dummy,
+            path,
+            input_names=["input"],
+            output_names=["landmarks"],
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+    except (TypeError, ModuleNotFoundError):
+        torch.onnx.export(
+            model,
+            dummy,
+            path,
+            input_names=["input"],
+            output_names=["landmarks"],
+            opset_version=opset,
+            do_constant_folding=True,
+        )
     print(f"ONNX model exported -> {path}")
 
 
