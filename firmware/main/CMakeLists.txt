@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+        "hand_tracker.cpp"
+    INCLUDE_DIRS
+        "."
+    EMBED_FILES
+        "models/hand_landmarks.espdl"
+)
