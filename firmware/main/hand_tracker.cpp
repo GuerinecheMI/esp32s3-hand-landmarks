@@ -9,6 +9,7 @@
 #include <cmath>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "dl_model_base.hpp"
 #include "dl_tool.hpp"
 
@@ -25,6 +26,10 @@ struct HandTracker::Impl {
     int8_t* input_buf = nullptr;
     float input_scale = 1.0f;
     int input_zero_point = 0;
+
+    // 256-element fast quantization lookup table: uint8 pixel -> int8 quantized
+    int8_t quant_lut[256]{};
+    bool ready = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -44,8 +49,10 @@ HandTracker::~HandTracker() {
 // Initialisation
 // ---------------------------------------------------------------------------
 bool HandTracker::init(const uint8_t* model_data, size_t model_size) {
-    if (!model_data || model_size == 0) {
-        ESP_LOGE(TAG, "Invalid model data");
+    if (!model_data || model_size < 128) {
+        ESP_LOGE(TAG, "Invalid model data or placeholder detected (size=%u bytes). "
+                      "Please train and quantize a model with python/quantize_espdl.py",
+                 (unsigned)model_size);
         return false;
     }
 
@@ -58,9 +65,12 @@ bool HandTracker::init(const uint8_t* model_data, size_t model_size) {
         return false;
     }
 
-    // Allocate quantised input buffer
+    // Allocate quantised input buffer (prefer internal SRAM if available, fallback to PSRAM)
     const size_t input_bytes = kInputSize * kInputSize;
-    impl_->input_buf = static_cast<int8_t*>(heap_caps_malloc(input_bytes, MALLOC_CAP_SPIRAM));
+    impl_->input_buf = static_cast<int8_t*>(heap_caps_malloc(input_bytes, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    if (!impl_->input_buf) {
+        impl_->input_buf = static_cast<int8_t*>(heap_caps_malloc(input_bytes, MALLOC_CAP_SPIRAM));
+    }
     if (!impl_->input_buf) {
         ESP_LOGE(TAG, "Failed to allocate input buffer (%d bytes)", (int)input_bytes);
         return false;
@@ -73,7 +83,17 @@ bool HandTracker::init(const uint8_t* model_data, size_t model_size) {
         impl_->input_zero_point = input_tensor->get_zero_point();
     }
 
-    ESP_LOGI(TAG, "Model loaded successfully (input scale=%.4f, zp=%d)",
+    // Precompute 256-entry quantization LUT for fast uint8 -> int8 translation
+    const float inv_scale = (impl_->input_scale > 0.0f) ? (1.0f / impl_->input_scale) : 1.0f;
+    const int zp = impl_->input_zero_point;
+    for (int i = 0; i < 256; ++i) {
+        float normalised = static_cast<float>(i) / 255.0f;
+        int32_t q = static_cast<int32_t>(roundf(normalised * inv_scale)) + zp;
+        impl_->quant_lut[i] = static_cast<int8_t>(q < -128 ? -128 : (q > 127 ? 127 : q));
+    }
+
+    impl_->ready = true;
+    ESP_LOGI(TAG, "Model loaded successfully (input scale=%.4f, zp=%d, LUT precomputed)",
              impl_->input_scale, impl_->input_zero_point);
     return true;
 }
@@ -84,21 +104,15 @@ bool HandTracker::init(const uint8_t* model_data, size_t model_size) {
 HandResult HandTracker::run(const uint8_t* gray_96x96) {
     HandResult result;
 
-    if (!impl_->model || !impl_->input_buf || !gray_96x96) {
-        ESP_LOGW(TAG, "Tracker not initialised or null input");
+    if (!impl_->ready || !impl_->model || !impl_->input_buf || !gray_96x96) {
+        ESP_LOGW(TAG, "Tracker not ready or null input");
         return result;
     }
 
-    // Quantise input: int8 = round(float_val / scale) + zero_point
-    const float inv_scale = 1.0f / impl_->input_scale;
-    const int zp = impl_->input_zero_point;
+    // Fast LUT-based input quantization (zero float operations per frame)
     const size_t num_pixels = kInputSize * kInputSize;
-
     for (size_t i = 0; i < num_pixels; ++i) {
-        float normalised = gray_96x96[i] / 255.0f;
-        int32_t q = static_cast<int32_t>(roundf(normalised * inv_scale)) + zp;
-        impl_->input_buf[i] = static_cast<int8_t>(
-            q < -128 ? -128 : (q > 127 ? 127 : q));
+        impl_->input_buf[i] = impl_->quant_lut[gray_96x96[i]];
     }
 
     // Copy into model input tensor

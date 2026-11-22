@@ -9,32 +9,44 @@ esp32s3-hand-landmarks/
 ├── python/                   # Training & quantisation pipeline
 │   ├── requirements.txt
 │   ├── roi_utils.py          # Hand ROI extraction helpers
-│   ├── collect_dataset.py    # Webcam / image dataset collector
-│   ├── model.py              # PyTorch landmark regression model
-│   ├── train.py              # Training loop
-│   └── quantize_espdl.py     # ONNX → ESP-DL quantised model
+│   ├── collect_dataset.py    # Webcam auto (MediaPipe) & manual collector
+│   ├── model.py              # PyTorch landmark model (optimized ~150k params)
+│   ├── train.py              # Training loop with clean train/val split
+│   └── quantize_espdl.py     # ONNX → ESP-DL INT8 quantised model
 ├── firmware/                 # ESP-IDF application
 │   ├── CMakeLists.txt
 │   ├── sdkconfig.defaults
+│   ├── partitions.csv        # Custom 8MB flash partition table
 │   └── main/
 │       ├── CMakeLists.txt
 │       ├── idf_component.yml
-│       ├── models/.gitkeep   # Place quantised .espdl model here
+│       ├── models/
+│       │   └── hand_landmarks.espdl # Place quantised model here
 │       ├── hand_tracker.hpp
-│       ├── hand_tracker.cpp
+│       ├── hand_tracker.cpp  # Fast 256-entry LUT quantization + ESP-DL inference
 │       └── main.cpp
 └── README.md
 ```
 
 ## Quick Start
 
-### 1. Train the model (host PC)
+### 1. Collect dataset & train (host PC)
 
 ```bash
 cd python
 pip install -r requirements.txt
+
+# Option A: Auto-annotate using webcam with MediaPipe (fastest)
+python collect_dataset.py --source webcam --auto --output dataset/
+
+# Option B: Manual interactive annotation
 python collect_dataset.py --source webcam --output dataset/
+
+# Train model
 python train.py --data dataset/ --epochs 120
+
+# Quantize to INT8 ESP-DL model (requires esp-ppq)
+pip install git+https://github.com/espressif/esp-ppq.git
 python quantize_espdl.py --checkpoint checkpoints/best.pth --output ../firmware/main/models/hand_landmarks.espdl
 ```
 
@@ -44,12 +56,16 @@ python quantize_espdl.py --checkpoint checkpoints/best.pth --output ../firmware/
 cd firmware
 idf.py set-target esp32s3
 idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py -p COM_PORT flash monitor
 ```
 
-## Model
+## Model Architecture & Optimizations
 
-The landmark model is a lightweight CNN that takes a **96 × 96** grayscale crop of the hand region and regresses **21 × 2 = 42** normalised (x, y) coordinates corresponding to the standard hand skeleton.
+- **Input:** 96 × 96 grayscale crop
+- **Encoder:** 4 Conv2d-BatchNorm-ReLU-MaxPool blocks (16 → 32 → 64 → 128 filters)
+- **Bottleneck:** `AdaptiveAvgPool2d((2, 2))` pooling down to 512 features, eliminating large fully-connected weight overhead
+- **Parameters:** ~150,000 parameters (~150 KB in INT8) — fits inside ESP32-S3 internal SRAM/cache
+- **On-chip Quantization:** 256-element precomputed lookup table (LUT) eliminates 9,216 floating-point calculations per frame
 
 | Landmark Index | Joint           |
 |---------------|-----------------|
@@ -62,9 +78,9 @@ The landmark model is a lightweight CNN that takes a **96 × 96** grayscale crop
 
 ## Hardware
 
-- **MCU:** ESP32-S3 (dual-core Xtensa LX7, 512 KB SRAM, PSRAM recommended)
-- **Camera:** OV2640 or OV5640 via DVP / SPI interface
-- **Display (optional):** SPI LCD for overlay visualisation
+- **MCU:** ESP32-S3 (dual-core Xtensa LX7 @ 240MHz, 8MB Flash, PSRAM)
+- **Camera:** OV2640 / OV5640 via DVP interface (ESP-S3-EYE, Freenove, or AI-Thinker)
+- **Output:** Normalised landmark coordinates JSON streamed over UART
 
 ## License
 

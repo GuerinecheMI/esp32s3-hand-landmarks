@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
 quantize_espdl.py – Convert a trained PyTorch checkpoint to an ESP-DL
-quantised model via ONNX.
+quantised INT8 model via ONNX.
 
-Pipeline::
+Pipeline:
+    PyTorch (.pth) -> ONNX -> INT8 calibration (PPQ) -> ESP-DL (.espdl)
 
-    PyTorch (.pth) → ONNX → INT8 calibration → ESP-DL quantised model (.espdl)
-
-Usage
------
+Usage:
     python quantize_espdl.py \\
         --checkpoint checkpoints/best.pth \\
         --calibration-dir dataset/images \\
         --output ../firmware/main/models/hand_landmarks.espdl
 
-Requires the ``esp-ppq`` quantisation toolkit from Espressif.
-See: https://github.com/espressif/esp-ppq
+Requires the esp-ppq quantization toolkit from Espressif:
+    pip install git+https://github.com/espressif/esp-ppq.git
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ def load_calibration_images(
     num_samples: int = 200,
     input_size: int = 96,
 ) -> np.ndarray:
-    """Load grayscale images as a float32 array ``(N, 1, 96, 96)``."""
+    """Load grayscale calibration images as a float32 array (N, 1, 96, 96)."""
     paths = sorted(cal_dir.glob("*.png"))[:num_samples]
     if not paths:
         raise FileNotFoundError(f"No .png calibration images found in {cal_dir}")
@@ -50,7 +48,8 @@ def load_calibration_images(
         img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
-        img = cv2.resize(img, (input_size, input_size))
+        if img.shape[0] != input_size or img.shape[1] != input_size:
+            img = cv2.resize(img, (input_size, input_size), interpolation=cv2.INTER_AREA)
         images.append(img.astype(np.float32) / 255.0)
 
     batch = np.stack(images)[:, np.newaxis, :, :]  # (N, 1, 96, 96)
@@ -68,24 +67,25 @@ def quantize_to_espdl(
     output_path: str,
     target_chip: str = "esp32s3",
 ) -> None:
-    """Quantise an ONNX model to INT8 using ESP-PPQ and export ``.espdl``."""
+    """Quantise an ONNX model to INT8 using ESP-PPQ and export .espdl."""
     try:
-        from espdl import export_model_to_espdl
         from ppq import QuantizationSettingFactory, TargetPlatform
-        from ppq.api import espdl_quantize_onnx
+        from ppq.api import espdl_quantize_onnx, export_ppq_graph
     except ImportError:
         print(
-            "ERROR: esp-ppq is not installed.\n"
-            "Install it with:\n"
+            "\nERROR: esp-ppq is not installed.\n"
+            "Please install it from Espressif's repository:\n"
+            "  pip install ninja cmake\n"
             "  pip install git+https://github.com/espressif/esp-ppq.git\n",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Calibration data as list of dicts
+    # Calibration dataloader
     calib_loader = [{"input": calibration_data[i : i + 1]} for i in range(calibration_data.shape[0])]
 
     setting = QuantizationSettingFactory.espdl_setting()
+    print(f"Running INT8 PTQ calibration for target chip: {target_chip}...")
     quantized = espdl_quantize_onnx(
         onnx_import_file=onnx_path,
         calib_dataloader=calib_loader,
@@ -95,9 +95,11 @@ def quantize_to_espdl(
         setting=setting,
     )
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    export_model_to_espdl(quantized, output_path)
-    print(f"Quantised model exported → {output_path}")
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    export_ppq_graph(graph=quantized, platform=TargetPlatform.ESPDL_S8, graph_save_to=str(out_p))
+    print(f"Quantised ESP-DL model successfully exported -> {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +112,8 @@ def run_pipeline(
     output: Path,
     num_cal_samples: int = 200,
 ) -> None:
-    """End-to-end: load checkpoint → ONNX → quantise → .espdl."""
-    # 1. Load & export ONNX
+    """End-to-end: load checkpoint -> ONNX -> quantise -> .espdl."""
+    # 1. Load checkpoint and export ONNX
     model = build_model()
     state = torch.load(str(checkpoint), map_location="cpu")
     model.load_state_dict(state)
@@ -123,10 +125,10 @@ def run_pipeline(
     # 2. Load calibration data
     cal_data = load_calibration_images(calibration_dir, num_samples=num_cal_samples)
 
-    # 3. Quantise
+    # 3. Quantise to .espdl
     quantize_to_espdl(onnx_path, cal_data, str(output))
 
-    print("\n✓ Pipeline complete.")
+    print("\n✓ ESP-DL quantization complete.")
     print(f"  ONNX  : {onnx_path}")
     print(f"  ESPDL : {output}")
 

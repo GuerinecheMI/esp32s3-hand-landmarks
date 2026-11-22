@@ -2,12 +2,13 @@
 """
 train.py – Training loop for HandLandmarkNet.
 
-Usage
------
+Usage:
     python train.py --data dataset/ --epochs 120 --lr 1e-3
 
-After training the best checkpoint is saved to ``checkpoints/best.pth`` and
-an ONNX export is written to ``exports/hand_landmarks.onnx``.
+Features:
+- Clean train/validation split with isolated data augmentation
+- Cosine annealing learning rate schedule
+- Automatic checkpointing and ONNX export for ESP-DL quantization
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from model import HandLandmarkNet, build_model, export_onnx
@@ -31,7 +32,7 @@ from model import HandLandmarkNet, build_model, export_onnx
 # ---------------------------------------------------------------------------
 
 class HandLandmarkDataset(Dataset):
-    """Reads crops and landmark CSVs produced by ``collect_dataset.py``."""
+    """Reads crops and landmark CSVs produced by collect_dataset.py."""
 
     def __init__(self, root: Path, augment: bool = False) -> None:
         self.images_dir = root / "images"
@@ -39,8 +40,13 @@ class HandLandmarkDataset(Dataset):
         self.samples: list[tuple[str, np.ndarray]] = []
 
         csv_path = root / "landmarks.csv"
-        with open(csv_path) as f:
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Missing landmarks CSV at: {csv_path}")
+
+        with open(csv_path, newline="") as f:
             for row in csv.reader(f):
+                if not row:
+                    continue
                 fname = row[0]
                 coords = np.array(list(map(float, row[1:])), dtype=np.float32)
                 self.samples.append((fname, coords))
@@ -54,16 +60,19 @@ class HandLandmarkDataset(Dataset):
         if img is None:
             raise FileNotFoundError(f"Image not found: {self.images_dir / fname}")
 
-        # Simple augmentation
+        coords = coords.copy()
+
+        # Data augmentation for training
         if self.augment:
+            # Horizontal flip
             if np.random.rand() > 0.5:
                 img = cv2.flip(img, 1)
                 coords_xy = coords.reshape(-1, 2)
                 coords_xy[:, 0] = 1.0 - coords_xy[:, 0]
                 coords = coords_xy.flatten()
 
-            # Brightness jitter
-            delta = np.random.randint(-30, 31)
+            # Random brightness jitter
+            delta = np.random.randint(-25, 26)
             img = np.clip(img.astype(np.int16) + delta, 0, 255).astype(np.uint8)
 
         tensor_img = torch.from_numpy(img).float().unsqueeze(0) / 255.0  # (1, 96, 96)
@@ -85,16 +94,30 @@ def train(
     export_dir: Path = Path("exports"),
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Using device: {device}")
 
-    dataset = HandLandmarkDataset(data_dir, augment=True)
-    val_len = int(len(dataset) * val_split)
-    train_len = len(dataset) - val_len
-    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+    # Create distinct train (augmented) and val (clean) dataset views
+    base_ds = HandLandmarkDataset(data_dir, augment=False)
+    total_samples = len(base_ds)
+    if total_samples == 0:
+        raise ValueError(f"No samples found in {data_dir}")
 
-    # Disable augmentation for validation split (approximation)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    val_len = max(1, int(total_samples * val_split))
+    indices = np.random.permutation(total_samples)
+    train_indices = indices[val_len:]
+    val_indices = indices[:val_len]
+
+    train_ds = Subset(HandLandmarkDataset(data_dir, augment=True), train_indices)
+    val_ds = Subset(HandLandmarkDataset(data_dir, augment=False), val_indices)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
+    )
+
+    print(f"Dataset: {len(train_ds)} training samples, {len(val_ds)} validation samples")
 
     model = build_model().to(device)
     criterion = nn.SmoothL1Loss()
@@ -110,7 +133,7 @@ def train(
         # --- Train ---
         model.train()
         train_loss = 0.0
-        for imgs, targets in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [train]", leave=False):
+        for imgs, targets in tqdm(train_loader, desc=f"Epoch {epoch:3d}/{epochs} [train]", leave=False):
             imgs, targets = imgs.to(device), targets.to(device)
             preds = model(imgs)
             loss = criterion(preds, targets)
@@ -118,7 +141,7 @@ def train(
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * imgs.size(0)
-        train_loss /= train_len
+        train_loss /= len(train_ds)
 
         # --- Validate ---
         model.eval()
@@ -129,24 +152,27 @@ def train(
                 preds = model(imgs)
                 loss = criterion(preds, targets)
                 val_loss += loss.item() * imgs.size(0)
-        val_loss /= val_len
+        val_loss /= len(val_ds)
 
         scheduler.step()
-
         lr_now = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | lr={lr_now:.2e}")
+
+        print(f"Epoch {epoch:3d}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | lr={lr_now:.2e}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt_path = checkpoint_dir / "best.pth"
             torch.save(model.state_dict(), ckpt_path)
-            print(f"  ↳ best model saved ({val_loss:.6f})")
+            print(f"  -> Best model saved ({val_loss:.6f})")
 
-    # Final ONNX export
-    model.load_state_dict(torch.load(checkpoint_dir / "best.pth", map_location=device))
+    # Export best model to ONNX
+    best_ckpt = checkpoint_dir / "best.pth"
+    model.load_state_dict(torch.load(best_ckpt, map_location=device))
     onnx_path = str(export_dir / "hand_landmarks.onnx")
     export_onnx(model, onnx_path)
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.6f}")
+    print(f"\n✓ Training complete! Best validation loss: {best_val_loss:.6f}")
+    print(f"  Checkpoint: {best_ckpt}")
+    print(f"  ONNX model: {onnx_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +180,8 @@ def train(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train HandLandmarkNet")
-    parser.add_argument("--data", type=Path, required=True, help="Dataset directory")
+    parser = argparse.ArgumentParser(description="Train HandLandmarkNet for ESP-DL")
+    parser.add_argument("--data", type=Path, required=True, help="Path to dataset directory")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)

@@ -2,8 +2,8 @@
  * @file main.cpp
  * @brief ESP32-S3 hand landmark tracker – application entry point.
  *
- * Captures frames from the camera, runs ROI detection and landmark
- * inference, then outputs landmark coordinates over UART.
+ * Captures frames from the camera, runs landmark inference,
+ * and outputs landmark coordinates as JSON over UART.
  */
 
 #include <cstdio>
@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_camera.h"
 
 #include "hand_tracker.hpp"
@@ -19,13 +20,30 @@
 static const char* TAG = "main";
 
 // ---------------------------------------------------------------------------
-// Embedded model (linked via CMakeLists.txt EMBED_FILES)
+// Embedded model symbols (linked via CMakeLists.txt EMBED_FILES)
 // ---------------------------------------------------------------------------
-extern const uint8_t model_start[] asm("_binary_hand_landmarks_espdl_start");
-extern const uint8_t model_end[]   asm("_binary_hand_landmarks_espdl_end");
+// Some ESP-IDF versions strip path prefix while others retain "models_"
+extern const uint8_t model_start[] asm("_binary_hand_landmarks_espdl_start") __attribute__((weak));
+extern const uint8_t model_end[]   asm("_binary_hand_landmarks_espdl_end") __attribute__((weak));
+
+extern const uint8_t model_rel_start[] asm("_binary_models_hand_landmarks_espdl_start") __attribute__((weak));
+extern const uint8_t model_rel_end[]   asm("_binary_models_hand_landmarks_espdl_end") __attribute__((weak));
+
+static inline void get_embedded_model(const uint8_t*& start, size_t& size) {
+    if (model_rel_start != nullptr && model_rel_end != nullptr && model_rel_end > model_rel_start) {
+        start = model_rel_start;
+        size = model_rel_end - model_rel_start;
+    } else if (model_start != nullptr && model_end != nullptr && model_end > model_start) {
+        start = model_start;
+        size = model_end - model_start;
+    } else {
+        start = nullptr;
+        size = 0;
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Camera pin configuration (ESP-S3-EYE / FREENOVE)
+// Camera pin configuration (ESP-S3-EYE / FREENOVE default pins)
 // ---------------------------------------------------------------------------
 static const camera_config_t camera_config = {
     .pin_pwdn     = -1,
@@ -60,41 +78,6 @@ static const camera_config_t camera_config = {
 };
 
 // ---------------------------------------------------------------------------
-// Simple skin-colour ROI (grayscale threshold fallback)
-// ---------------------------------------------------------------------------
-static bool find_hand_roi(
-    const uint8_t* gray, int width, int height,
-    int& roi_x, int& roi_y, int& roi_size
-) {
-    // Coarse threshold-based detection on grayscale
-    int min_x = width, min_y = height, max_x = 0, max_y = 0;
-    int count = 0;
-
-    for (int y = 0; y < height; y += 2) {
-        for (int x = 0; x < width; x += 2) {
-            uint8_t px = gray[y * width + x];
-            // Simple brightness threshold (tune for your setup)
-            if (px > 60 && px < 220) {
-                if (x < min_x) min_x = x;
-                if (x > max_x) max_x = x;
-                if (y < min_y) min_y = y;
-                if (y > max_y) max_y = y;
-                count++;
-            }
-        }
-    }
-
-    if (count < 100) return false;
-
-    int w = max_x - min_x;
-    int h = max_y - min_y;
-    roi_size = (w > h) ? w : h;
-    roi_x = min_x;
-    roi_y = min_y;
-    return roi_size > 20;
-}
-
-// ---------------------------------------------------------------------------
 // Print landmarks as JSON over UART
 // ---------------------------------------------------------------------------
 static void print_landmarks(const hand::HandResult& result) {
@@ -107,27 +90,30 @@ static void print_landmarks(const hand::HandResult& result) {
 }
 
 // ---------------------------------------------------------------------------
-// Main task
+// Main inference task
 // ---------------------------------------------------------------------------
 static void inference_task(void* /*arg*/) {
     // Initialise camera
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+        ESP_LOGE(TAG, "Camera init failed: 0x%x. Verify pinout and sensor connection.", err);
         vTaskDelete(nullptr);
         return;
     }
-    ESP_LOGI(TAG, "Camera initialised");
+    ESP_LOGI(TAG, "Camera initialised (96x96 grayscale)");
 
-    // Load hand landmark model
+    // Retrieve embedded model
+    const uint8_t* model_data = nullptr;
+    size_t model_size = 0;
+    get_embedded_model(model_data, model_size);
+
     hand::HandTracker tracker;
-    size_t model_size = model_end - model_start;
-    if (!tracker.init(model_start, model_size)) {
-        ESP_LOGE(TAG, "Model init failed");
-        vTaskDelete(nullptr);
-        return;
+    if (!model_data || model_size == 0 || !tracker.init(model_data, model_size)) {
+        ESP_LOGW(TAG, "Model not loaded (size=%u). Running camera stream only.", (unsigned)model_size);
+        ESP_LOGW(TAG, "Train and quantize model using python/ scripts, then re-flash.");
+    } else {
+        ESP_LOGI(TAG, "Hand tracker ready (%u bytes model)", (unsigned)model_size);
     }
-    ESP_LOGI(TAG, "Hand tracker ready (model %u bytes)", (unsigned)model_size);
 
     // Inference loop
     uint32_t frame_count = 0;
@@ -139,27 +125,25 @@ static void inference_task(void* /*arg*/) {
             continue;
         }
 
-        // The camera is configured for 96×96 grayscale, which matches
-        // the model input directly — no resize needed.
         if (fb->width == hand::kInputSize && fb->height == hand::kInputSize) {
             hand::HandResult result = tracker.run(fb->buf);
             if (result.valid) {
                 print_landmarks(result);
             }
         } else {
-            ESP_LOGW(TAG, "Unexpected frame size: %dx%d", fb->width, fb->height);
+            ESP_LOGW(TAG, "Unexpected frame size: %dx%d (expected %dx%d)",
+                     fb->width, fb->height, hand::kInputSize, hand::kInputSize);
         }
 
         esp_camera_fb_return(fb);
         frame_count++;
 
         if (frame_count % 100 == 0) {
-            ESP_LOGI(TAG, "Frames processed: %lu, free heap: %lu",
+            ESP_LOGI(TAG, "Frames processed: %lu, free heap: %lu bytes",
                      (unsigned long)frame_count,
                      (unsigned long)esp_get_free_heap_size());
         }
 
-        // Yield to other tasks
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -171,7 +155,7 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "=== ESP32-S3 Hand Landmark Tracker ===");
     ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // Run inference on core 1, 8 KB stack
+    // Run inference task on Core 1 with 8 KB stack
     xTaskCreatePinnedToCore(
         inference_task,
         "inference",
@@ -179,6 +163,6 @@ extern "C" void app_main(void) {
         nullptr,
         5,
         nullptr,
-        1  // core 1
+        1
     );
 }
